@@ -1,0 +1,20 @@
+{
+  "name": "creator-image-cutover",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/creator_asset_service.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/creator_image_pipeline.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
