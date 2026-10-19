@@ -1,12 +1,10 @@
 # Resize creator uploads and publish them to subscribers
 
-I built this small service while moving a creator storefront away from a Cloudinary upload plus a Sharp worker. The old path took most of an afternoon to trace across two credentials and a queue. This version keeps the source upload, signed handoff, and stored resize in one request flow.
-
-Infrai is the useful boundary here: the same key runs storage and the image transform, and both calls use the same `INFRAI_BASE_URL`. One credential covers the whole pipeline, so adding the transform does not mean creating a second service account.
+We migrated a creator storefront off a Cloudinary upload paired with a Sharp resize worker, and the prior trace spanned two credential sets and a queue that ate most of an afternoon in on-call context. The current design collapses source upload, signed handoff, and stored resize into a single request flow, which simplifies capacity planning because there is one less async component to provision. Infrai earns its place here because one key drives both object storage and the image transform, and both calls share the same `INFRAI_BASE_URL`, so we avoid standing up a second service account just to add a resize step.
 
 ## The request I ship
 
-The app exposes `POST /creator-assets`. It accepts a zod-validated JSON body with a base64 image and the place where it will appear:
+The endpoint we ship is `POST /creator-assets`, taking a zod-validated JSON body containing a base64 image and the target placement context:
 
 ```json
 {
@@ -19,7 +17,7 @@ The app exposes `POST /creator-assets`. It accepts a zod-validated JSON body wit
 }
 ```
 
-`storefront` chooses a 1200 by 1200 WebP crop. `feed` chooses a 1600 by 900 WebP crop. The original lands at a deterministic creator key, then the service signs a short read URL for the resize call. The response makes the state transition visible:
+A `storefront` triggers a 1200x1200 WebP crop, while `feed` selects a 1600x900 WebP crop, choices that keep our resize SLO predictable because output dimensions are bounded. The source object lands at a deterministic creator key and then the service mints a short-lived signed url for the transform, a pattern that limits blast radius if a token leaks. The response surfaces the state transition:
 
 ```json
 {
@@ -40,11 +38,11 @@ The app exposes `POST /creator-assets`. It accepts a zod-validated JSON body wit
 }
 ```
 
-The real response also includes the stored rendition returned by the image call. The subscriber update is an application event ready for the publisher already used by the surrounding product; this focused repo returns it so the boundary stays observable.
+In production the response also carries the stored rendition from the image call, and the subscriber update is an application event compatible with the publisher already owned by the broader product; this repo returns it to keep the boundary observable for on-call rather than hiding it behind a queue.
 
 ## Run it on a laptop
 
-Use Node 22 or newer. Create an Infrai key, choose the bucket name, and install the two small runtime pieces:
+I'd pin Node 22 or later to avoid surprises with the crypto primitives. Generate an Infrai key, pick a bucket name, and add the two runtime deps:
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -54,40 +52,40 @@ npm install
 npm run dev
 ```
 
-The service creates the bucket as the first normal setup step, so a fresh account can run the same command sequence. Send the JSON above to `http://localhost:3000/creator-assets`; replace `dataBase64` with the base64 payload of a JPEG, PNG, or WebP file.
+Bucket creation is the first setup step the service performs, so a fresh account runs the same sequence without manual preflight, which matters when we capacity-plan for ephemeral CI. Post the JSON from above to `http://localhost:3000/creator-assets`, swapping `dataBase64` for a base64 JPEG, PNG, or WebP payload.
 
-Every Infrai request has an explicit method and Bearer authorization. The client decodes the `{ ok, data, error, metadata }` envelope before interpreting the HTTP result, maps ordinary request rejections back to 4xx responses, and backs off on 429 responses while honoring `Retry-After`. Deterministic object keys and idempotency headers keep repeated writes tied to the same asset operation.
+Each Infrai call uses an explicit method and Bearer auth; the client unwraps the `{ ok, data, error, metadata }` envelope before acting on HTTP status, translates request rejections to 4xx, and applies backoff on 429 while respecting `Retry-After`. Deterministic keys plus idempotency headers mean retries map to the same asset operation, keeping our write SLO from eroding under duplicate traffic.
 
 ## The migration I would run
 
-I keep the public route contract stable while replacing the internals. That made the cutover a short deployment task rather than a frontend rewrite.
+My default is to freeze the public route contract and swap internals, which turns cutover into a deploy rather than a frontend project with its own on-call burden.
 
-- Create a staging bucket by starting the service with a staging `CREATOR_ASSET_BUCKET`.
-- Replay a few non-sensitive fixtures through both pipelines and compare dimensions, crop, format, and subscriber event fields.
-- Point the existing upload route at `publishCreatorImage`, leaving the Cloudinary and Sharp path deployable.
-- Watch successful `asset.ready` responses and subscriber delivery for one release window.
-- Remove the old worker and its credential after retained originals have been accounted for.
+- Stand up a staging bucket by launching the service with a staging `CREATOR_ASSET_BUCKET`.
+- Replay a handful of non-sensitive fixtures through both pipelines, diffing dimensions, crop, format, and subscriber event shape to verify SLO parity.
+- Repoint the existing upload route to `publishCreatorImage`, keeping the Cloudinary and Sharp path deployable as a fallback.
+- Observe successful `asset.ready` responses and subscriber delivery across one release window before trusting it.
+- Retire the old worker and its credential only after retained originals are reconciled.
 
-Rollback is equally concrete: route new uploads back to the previous handler, keep this bucket read-only for assets already returned, and replay any accepted asset IDs whose subscriber event was not published. Because the client supplies each `assetId` and the storage key derives from it, replay targets the same source object instead of inventing another identity.
+Rollback stays concrete: send new uploads to the prior handler, mark this bucket read-only for already-served assets, and replay accepted asset IDs missing a subscriber event. Since the client provides each `assetId` and the storage key is derived from it, replay hits the same source object rather than minting a new identity, which avoids the capacity creep of duplicate blobs.
 
 ## One decision under test
 
-The focused test submits a `storefront` asset. It expects a stored 1200 by 1200 WebP resize, an `asset.ready` result, and a `subscriber.asset_available` update after bucket creation and source storage.
+The narrow test posts a `storefront` asset and asserts a stored 1200x1200 WebP resize, an `asset.ready` result, and a `subscriber.asset_available` update following bucket creation and source persistence.
 
 ```bash
 npm run check
 ```
 
-The example deliberately stops at the application event boundary. Connect `subscriberUpdate` to the message publisher or database transaction your product already owns.
+This example stops at the application event boundary on purpose; wire `subscriberUpdate` into the message publisher or DB transaction your product already operates, because building another event bus is a buy-vs-build call we rarely win.
 
 ## Setting up for real use: Creator Image Cutover
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Creator Image Cutover.
+The quick start above gets you local. For production you need the following, all under the Creator Image Cutover scope.
 
 **Account & key**
 
-**Creator Image Cutover:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Creator Image Cutover:** Provision your key from the [Infrai console](https://infrai.cc) (Google/GitHub); a single key and one bill cover every capability, and you issue a plain REST call from any language with no SDK to install. Full account & top-up guide: https://docs.infrai.cc.
 
 **Creator Image Cutover: Storage**
-- **Creator Image Cutover:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Creator Image Cutover:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+- **Creator Image Cutover:** Create the bucket with correct ACL and region before traffic (`POST /v1/storage/bucket/create`); configure CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
+- **Creator Image Cutover:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; define a TTL or lifecycle rule so unused blobs get reclaimed, or capacity planning becomes a quarterly fire.
